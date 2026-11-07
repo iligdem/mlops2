@@ -1,0 +1,140 @@
+# Стек ДЗ: Triton + vLLM + gateway + Prometheus + node-exporter.
+#
+# Отличия от шаблона (обусловлены общим сервером):
+#   * хост-порты сдвинуты: 8080/9090/9100 заняты прод-стеком;
+#   * vLLM жёстко ограничен по памяти — на карте живёт прод-сервис (~20 из 32.6 ГБ);
+#   * gateway публикуется только на GATEWAY_PORT, наружу его отдаёт туннель.
+name: hw-realtime-inference
+
+services:
+  triton:
+    # 24.06 из задания собран под CUDA 12.4 и не поддерживает sm_120 (Blackwell);
+    # поддержка Blackwell появилась в Triton 25.01, поэтому берём свежий тег.
+    # Зеркало daocloud проксирует тот же nvcr.io (digest amd64-манифеста совпадает),
+    # но, в отличие от nvcr.nju.edu.cn, отдаёт образ без таймаутов на крупных слоях.
+    image: m.daocloud.io/nvcr.io/nvidia/tritonserver:26.10-py3
+    platform: linux/amd64
+    command: >
+      tritonserver
+      --model-repository=/models
+      --model-control-mode=explicit
+      --load-model=${CV_MODEL}
+      --allow-metrics=true
+      --allow-gpu-metrics=true
+      --log-info=true
+      --strict-model-config=false
+    volumes:
+      - ./model_repository:/models:ro
+    ports:
+      - "${TRITON_HOST_PORT:-18002}:8002"
+    shm_size: "2gb"
+    ulimits:
+      stack: 67108864
+      memlock: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v2/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  vllm:
+    image: vllm/vllm-openai:v0.33.0
+    command: >
+      --model Qwen/Qwen2.5-1.5B-Instruct
+      --served-model-name ${LLM_MODEL}
+      --port 8000
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.20}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-4096}
+      --max-num-seqs ${VLLM_MAX_NUM_SEQS:-24}
+      --enforce-eager
+      --disable-log-requests
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "${VLLM_HOST_PORT:-18000}:8000"
+    ipc: host
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/v1/models || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - CV_MODEL=${CV_MODEL}
+      - LLM_MODEL=${LLM_MODEL}
+      - STUDENT_NAME=${STUDENT_NAME}
+      - STUDENT_EMAIL=${STUDENT_EMAIL}
+      - GPU_NAME=${GPU_NAME}
+      - GATEWAY_VERSION=${GATEWAY_VERSION:-1.0}
+      - TRITON_URL=http://triton:8000
+      - TRITON_METRICS_URL=http://triton:8002/metrics
+      - VLLM_URL=http://vllm:8000
+      - VLLM_METRICS_URL=http://vllm:8000/metrics
+      - NODE_METRICS_URL=http://node-exporter:9100/metrics
+      - TRITON_TIMEOUT_S=10
+      - VLLM_TIMEOUT_S=120
+      - PREPROCESS_WORKERS=8
+    ports:
+      - "${GATEWAY_PORT:-8090}:8080"
+    depends_on:
+      - triton
+      - vllm
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-19090}:9090"
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "${NODE_EXPORTER_HOST_PORT:-19100}:9100"
+    pid: host
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
+  prometheus_data:

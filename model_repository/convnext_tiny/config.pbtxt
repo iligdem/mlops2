@@ -1,0 +1,32 @@
+name: "convnext_tiny"
+platform: "onnxruntime_onnx"
+max_batch_size: 8
+
+input [
+  {
+    name: "INPUT__0"
+    data_type: TYPE_FP32
+    dims: [3, 224, 224]
+  }
+]
+
+output [
+  {
+    name: "OUTPUT__0"
+    data_type: TYPE_FP32
+    dims: [1000]
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [2, 4, 8]
+  max_queue_delay_microseconds: 50000
+}
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [0]
+  }
+]
